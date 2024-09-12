@@ -1,4 +1,4 @@
-# sfdep (development version)
+# sfdep 0.3.0
 
 - Fixes bug with cli and closes #49
 
