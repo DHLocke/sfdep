@@ -1,3 +1,9 @@
+# sfdep 0.2.3
+
+# sfdep 0.3.2
+
+# sfdep 0.3.1
+
 # sfdep 0.3.0
 
 - Fixes bug with cli and closes #49
