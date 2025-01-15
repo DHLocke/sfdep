@@ -1,0 +1,549 @@
+---
+title: "Spatial Regression with SFDEP and Friends"
+author: "Dexter H. Locke and Josiah Parry"
+vignette: >
+  %\VignetteIndexEntry{Spatial Regression with SFDEP and Friends}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+output: rmarkdown::html_vignette
+date: "`r Sys.Date()`"
+---
+
+Spatial regression is not new. Examples of spatial regression tutorials are abundant.
+
+[todo list examples]
+
+But the goal of the sfdep package is to combine spdep functionality with the ease of use and familiarity of the tidyverse syntax, using list columns, or more precisely as explained [here](https://sfdep.josiahparry.com/)
+
+"sfdep creates an sf and tidyverse friendly interface to the package as well as introduces new functionality that is not present in spdep. sfdep utilizes list columns extensively to make this interface possible."
+
+The purpose of this vignette is to provide a full, worked example of a spatial regression workflow, including exploratory data analyses. This example also shows the connections to other related packages in the R spatial ecosystem [todo insert list of examples]
+
+### Get Spatial Data
+
+We need something to work with. [spData](https://jakubnowosad.com/spData/) has an abundance of spatial data to explore. For this example we will be using the data associated with this paper
+
+Locke, D. H., Landry, S., Grove, J. M., Roy Chowdhury, R.. (2016). What’s scale got to do with it? Models for urban tree canopy. Journal of Urban Ecology. 2(1): 1-16. doi:10.1093/jue/juw006 [[link to paper]](https://www.fs.usda.gov/research/treesearch/53415)
+
+The data can be found here
+
+Locke, D.H. (2016): Data and R code supplement to "What’s scale got to do with it? Models for urban tree canopy". Figshare. <https://dx.doi.org/10.6084/m9.figshare.3814665.v2> Retrieved: Sep 17, 2016 (GMT)
+
+The associated "PhillySpatialEconometrix_Figshare.rtf" was the R code used for those analyses. Its terrible. It wasn't best practices for that time period, and certainly does not follow modern standards, expectations, and the efficiencies and clarity afforded by `sfdep` and the `tidyverse`.
+
+The example below is an entirely re-worked analysis; [todo] there might be some discrepancies. This example only focuses on the block group-level analyses and ignores the multi-level modeling of parcels nested within block groups, and the cross-level interactions.
+
+#### 0 load libraries, get oriented, define custom functions
+```{r}
+
+# Load libraries, create a vector of packages to install/load
+packs <-c(  'tidyverse'   # cuz
+          , 'tidylog'     # prints out what was done in dplyr and tidyr; VERBOSE
+          , 'sf'          # for spatial data support
+          , 'sfdep'       # the purpose of this entire tutorial
+          # , 'janitor'   # helps clean things pipe-friendly cross-tabulations
+          # , 'beepr'
+          , 'tictoc'      # times things, has *nothing* to do with social media
+          , 'magrittr'    # for all of the the pipes
+          , 'performance' # model comparisons
+          , 'gtsummary'   # Good Table Summaries
+          )
+
+# if these packages are not already installed, install them, otherwise do nothing
+if (length(setdiff(packs, rownames(installed.packages()))) > 0) {
+install.packages(setdiff(packs, rownames(installed.packages())))
+}
+
+# load all of the packages at once
+vapply(packs, library, character.only = TRUE, logical(1), logical.return = TRUE, quietly = TRUE)
+
+# where are we? 
+list.files()
+
+#' Calculates the morans i for each numeric variable in a dataset, using permutation
+multi_moran <- 
+  function(.data, nb_col = "nb", wt_col = "wt", ...) {
+    .data |> 
+      reframe(
+        across(where(is.numeric),
+               \(.x) broom::tidy(global_moran_perm(.x, .data[[nb_col]], .data[[wt_col]], ...)))
+        ) |> 
+      tidyr::pivot_longer(everything(), names_to = "variable") |> 
+      tidyr::unnest(value) |> 
+      dplyr::select(-c("method")) |> 
+      dplyr::rename(`Moran's I` = statistic, n_obs = parameter, p_value = p.value)
+  }
+
+```
+
+#### 1 download data
+```{r}
+
+# create destination data folder, if one does not exist)
+if(!dir.exists('vignettes/data')) dir.create('vignettes/data')
+
+# TODO is there a better way?
+(
+  shp_pieces_to_download <- 
+    tribble(~row  ,~url                                             ,~file
+             , 1  ,'https://figshare.com/ndownloader/files/5965479' ,'vignettes/data/Philly_CBG_shp.dbf'
+             , 2  ,'https://figshare.com/ndownloader/files/5965491' ,'vignettes/data/Philly_CBG_shp.shx'
+             , 3  ,'https://figshare.com/ndownloader/files/5965482' ,'vignettes/data/Philly_CBG_shp.prj'
+             , 4  ,'https://figshare.com/ndownloader/files/5965485' ,'vignettes/data/Philly_CBG_shp.shp'
+             , 5  ,'https://figshare.com/ndownloader/files/5965488' ,'vignettes/data/Philly_CBG_shp.shp.xml'
+            ) |> select(-row)
+  )
+
+# download each of the shapefile components, and time it
+tictoc::tic(); for(i in 1:nrow(shp_pieces_to_download)){
+  print(i)
+  
+  download.file(  url      = shp_pieces_to_download[i,] |> pull(url)
+                , destfile = shp_pieces_to_download[i,] |> pull(file)
+                )
+  }; tictoc::toc() # ~5 seconds
+
+```
+
+
+
+### Read in data, double / santity checks
+
+```{r}
+
+# read in the data
+(shp <- st_read('vignettes/data/Philly_CBG_shp.shp', as_tibble = TRUE))
+
+# take a looks
+shp |> glimpse()
+
+### Here is what the field names mean
+# NAME		    Block Group Identifier (Census FIPS CODE)
+# UTC_E_P		  Urban Tree Canopy Existing Percent, private residential lands only, excluding building footprint
+# UTC_P_P		  Urban Tree Canopy Possible Percent,	private residential lands only, excluding building footprint
+# PopD		    Population Density, (pop / mi^2)
+# HseD		    Housing Density, (housing units / mi^2)
+# MHHInc		  Median Household Income, $s
+# MktVal14AV	Average Market Value of property, 2014
+# PctVac		  Vacant Housing Units, % 
+# AveBldAge	  Average Building Age
+# AveBldAgeS	Average Building Age Squared
+# PctAfam		  African American Population, %
+# PctDH		    Detached Homes, % area of Census Block Group
+# PctRowHm		Row Homes, % area of Census Block Group
+# AveHHS		  Average Household Size
+# PctOWN		  Owner Occupied Housing, %
+# PctOpen		  Open Space, % area of Census Block Group
+# PctMar		  Married Households, % of Families
+
+# is that unique ID truely unique?
+unique(length(shp$NAME))
+all.equal(unique(length(shp$NAME)), nrow(shp)) # yes
+
+```
+
+### Exploratory Data Analyses: Quantiative Distributions, Graphs and Maps
+
+```{r}
+
+# five-number summaries
+shp |> summary()
+
+# check for missing data
+shp |> map_df(~sum(is.na(.))) |> glimpse() # none!
+
+# TODO EEK, everything is correlated, maybe cut?
+shp |> st_drop_geometry() |> correlation::correlation()
+
+shp |> 
+  st_drop_geometry() |> # dropping the spatial information 
+  pivot_longer(-NAME) |> 
+  mutate(name = # to order the facets in a logical order (same as column order) instead of alphabetical
+           factor(  name
+                  , levels = c(
+                      'NAME'
+                    , 'UTC_E_P'
+                    , 'UTC_P_P'
+                    , 'PopD'
+                    , 'HseD'
+                    , 'MHHInc'
+                    , 'MktVal14AV'
+                    , 'PctVac'
+                    , 'AveBldAge'
+                    , 'AveBldAgeS'
+                    , 'PctAfam'
+                    , 'PctDH'
+                    , 'PctRowHm'
+                    , 'AveHHS'
+                    , 'PctOWN'
+                    , 'PctOpen'
+                    , 'PctMar'
+                    )
+                  )) |>
+  ggplot(aes(value)) +
+  geom_density() + 
+  facet_wrap(~name, scales = 'free') +
+  theme_bw(16) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5), legend.position = 'bottom') +
+  NULL
+
+
+# map the dependent variables
+# UTC_E_P is Urban Tree Canopy Existing as a Percent
+# UTC_P_P is Urban Tree Canopy Possible as a Percent
+shp |> 
+  select(NAME, starts_with('UTC')) |> 
+  pivot_longer(-c(NAME, geometry)) |> 
+  ggplot() +
+  geom_sf(aes(fill = value), color = NA) +
+  facet_wrap(~name) +
+  # theme_bw(16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5)) +
+  NULL
+
+# we can map all of the variables at the same time, but they are on very different scales (%'s, $'s, years, etc)
+# so applying one scale to all of them won't be pretty. We can z-score to make all variables unit-less, relative
+# to the mean and standard deviation, but even still extreme numbers from one variable may produce a color ramp
+# that obscures 
+shp |> 
+  tidylog::mutate(across(-c(NAME, geometry), scale)) |>
+  pivot_longer(-c(NAME, geometry)) |> 
+  mutate(name = # to order the facets in a logical order (same as column order) instead of alphabetical
+           factor(  name
+                  , levels = c(
+                      'NAME'
+                    , 'UTC_E_P'
+                    , 'UTC_P_P'
+                    , 'PopD'
+                    , 'HseD'
+                    , 'MHHInc'
+                    , 'MktVal14AV'
+                    , 'PctVac'
+                    , 'AveBldAge'
+                    , 'AveBldAgeS'
+                    , 'PctAfam'
+                    , 'PctDH'
+                    , 'PctRowHm'
+                    , 'AveHHS'
+                    , 'PctOWN'
+                    , 'PctOpen'
+                    , 'PctMar'
+                    )
+                  )) |> 
+  ggplot() +
+  geom_sf(aes(fill = value), color = NA) +
+  facet_wrap(~name) +
+  # theme_bw(16) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5), legend.position = 'bottom') +
+  NULL
+
+# interactive map
+shp |> 
+  mutate(UTC_E_P = round(UTC_E_P)) |> # just to make the hover value slightly cleaner
+  mapview::mapview(zcol = 'UTC_E_P'
+                    # '<br>' so that the legend is more compact, and consumes less space
+                   , layer.name = 'Existing Tree<br>Canopy Cover<br>(% of residential<br>land)') 
+
+
+```
+
+### Summaries Including Global Moran's I
+
+```{r}
+
+
+(
+  summ_stats <-
+    shp |>
+    st_drop_geometry() |>          # drop the spatial data
+    rename_with(~ str_remove_all(.x, '_')) |> 
+    select(-NAME) |>               # pick columns to include, could also use selectors in "across" next instead
+    summarise(across( everything()
+                      # these are the summary statistics to be created
+                      , list(mean = mean, sd = sd, min = min, max = max, median = median, iqr = IQR)
+                      # new columns will be column name followed by an underscore followed by the statistic
+                      , .names = "{.col}_{.fn}")
+              ) |> 
+    pivot_longer(  everything() # reshape
+                 , names_to = c('variable', 'statistic')
+                 , names_sep = "_"
+                 , values_to = 'temp'
+                 # , names_pattern = '(.)_(.)'
+                 # , names_pattern = "(.)_(.col)"
+                 ) |> 
+    pivot_wider(id_cols = 'variable', names_from = 'statistic', values_from = 'temp')
+  )
+
+
+
+tictoc::tic(); (
+  MIs <- 
+    shp |> 
+    rename_with(~ str_remove_all(.x, '_')) |> 
+    # heart of what sfdep has to offer
+    mutate(  nb = st_contiguity(geometry, queen = TRUE)
+           , wt = st_weights(nb)
+           ) |> 
+    # pick columns to include, could also use selectors in "across" next instead
+    select(-NAME, nb, wt) |> # must include nb and wt (or whatever they have been named)
+    multi_moran()            # uses permutation, can be a little slow
+  ); tictoc::toc() # ~3 seconds
+
+
+# combine the summary statistics with the Moran's I
+(
+  Table_1_summary_statistics <- 
+    summ_stats |> 
+    left_join(MIs, by    = 'variable') |> 
+    select(  Variable    = variable
+           , Mean        = mean
+           , SD          = sd
+           , `Moran's I`
+           , `p-value`   = p_value
+           ) |> 
+    # mutate_if(is.numeric, round, 2)
+    mutate_at(vars(Mean : `Moran's I`), round, 2)
+  )
+
+# TODO write out?
+
+```
+
+### Fit an Ordinary Least Squares (OLS) models
+
+```{r}
+# Existing UTC, PD, OLS
+shp |> glimpse()
+
+# standardize via z-scores (aka scale) predictors
+shp_z <-
+  shp |> 
+  mutate(across(PopD : PctMar, ~scale(.x)[,1])) # scale returns a matrix, not a vector, hence '[,1]'
+  # https://stackoverflow.com/questions/74980587/how-to-preserve-column-names-after-applying-scale
+  
+
+# EXISTING UTC
+# Existing UTC, PD, OLS
+Model.1 <- 
+  shp_z %$% # pipe for functions that are not inherently pipe-aware
+  lm(UTC_E_P ~ PopD + HseD
+     , data = .
+     ) %$% # pipe for functions that are not inherently pipe-aware
+  step(object = ., k = 2)
+
+# Existing UTC, SES, OLS
+Model.5 <- 
+  shp_z %$%
+  lm(UTC_E_P ~ PopD + HseD + 
+       MHHInc + MktVal14AV + PctVac + AveBldAge + AveBldAgeS + PctAfam
+     ) %$% 
+  step(object = ., k = 2)
+
+# Existing UTC, LS, OLS
+Model.9 <- 
+  shp_z %$%
+  lm(UTC_E_P ~ PopD + HseD + 
+       MHHInc + MktVal14AV + PctVac + AveBldAge + AveBldAgeS + PctAfam + 
+       PctDH + PctRowHm + AveHHS + PctOWN + 	PctOpen + PctMar
+     ) %$%
+  step(k = 2, object = .)
+
+
+# POSSIBLE UTC
+# Possible UTC, PD, OLS
+Model.13 <- 
+  shp_z %$% # pipe for functions that are not inherently pipe-aware
+  lm(UTC_P_P ~ PopD + HseD
+     , data = .
+     ) %$% # pipe for functions that are not inherently pipe-aware
+  step(object = ., k = 2)
+
+
+# Possible UTC, SES, OLS
+Model.17 <- 
+  shp_z %$%
+  lm(UTC_P_P ~ PopD + HseD + 
+       MHHInc + MktVal14AV + PctVac + AveBldAge + AveBldAgeS + PctAfam
+     ) %$% 
+  step(object = ., k = 2)
+
+# Possible UTC, LS, OLS
+Model.21 <- 
+  shp_z %$%
+  lm(UTC_P_P ~ PopD + HseD + 
+       MHHInc + MktVal14AV + PctVac + AveBldAge + AveBldAgeS + PctAfam + 
+       PctDH + PctRowHm + AveHHS + PctOWN + 	PctOpen + PctMar
+     ) %$%
+  step(k = 2, object = .)
+
+# although it is tempting, it is premature to see which model fits best to address the research questions
+# because the model assumptions have not been varified
+
+compare_performance(
+    Model.1 # Existing UTC, PD, OLS
+  , Model.5 # Existing UTC, SES, OLS
+  , Model.9 # Existing UTC, LS, OLS
+  , rank = TRUE
+  , metrics = 'AIC'
+  )
+
+compare_performance(
+    Model.13 # Possible UTC, PD, OLS
+  , Model.17 # Existing UTC, SES, OLS
+  , Model.21 # Existing UTC, LS, OLS
+  , rank = TRUE
+  , metrics = 'AIC'
+  )
+
+# another approach
+list(
+    Model.1 # Existing UTC, PD, OLS
+  , Model.5 # Existing UTC, SES, OLS
+  , Model.9 # Existing UTC, LS, OLS
+  ) |> 
+  map(AIC)
+
+```
+
+
+#### OLS a-spatial regression diagnostics
+```{r}
+
+# how are the wining models peforming
+performance::check_model(Model.9)
+
+performance::check_model(Model.21)
+
+# not great but not terrible either. 
+
+```
+
+
+#### OLS spatial regresssion diagnostics
+```{r}
+
+# function to report which model is most appropriate
+# need to implement branching logic from anselin & rey 2014
+which_sar_model <- 
+  function(mod, nb, wt) {
+    rlang::check_installed("broom")
+  
+    lm_tests <- spdep::lm.RStests(mod, recreate_listw(nb, wt), test = "all")
+    
+    lm_tests_sigs <- dplyr::bind_rows(lapply(lm_tests, broom::tidy), .id = "test")
+    
+    # logic to print which test to perform 
+    if(
+      lm_tests_sigs[lm_tests_sigs$test == 'RSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'RSlag', ]$p.value >= 0.05
+      ) {
+      chosen_model <- 'RSerr'
+      } else if(
+      lm_tests_sigs[lm_tests_sigs$test == 'RSerr', ]$p.value >= 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'RSlag', ]$p.value <  0.05
+    ){
+      chosen_model <- 'RSlag'
+    } else if(
+      lm_tests_sigs[lm_tests_sigs$test == 'RSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'RSlag', ]$p.value < 0.05 &
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSlag', ]$p.value >= 0.05
+    ){
+      chosen_model <- 'adjRSerr'
+    } else if(
+      lm_tests_sigs[lm_tests_sigs$test == 'RSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'RSlag', ]$p.value < 0.05 &
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSerr', ]$p.value >= 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSlag', ]$p.value < 0.05
+    ){
+      chosen_model <- 'adjRSlag'
+    } else if(
+      lm_tests_sigs[lm_tests_sigs$test == 'RSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'RSlag', ]$p.value < 0.05 &
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSerr', ]$p.value < 0.05 & 
+      lm_tests_sigs[lm_tests_sigs$test == 'adjRSlag', ]$p.value < 0.05 &
+      lm_tests_sigs[lm_tests_sigs$test == 'SARMA', ]$p.value < 0.05
+    ){
+      chosen_model <- 'SARMA'
+    }
+  
+    cli::cli_alert_info("Most appropriate model is {chosen_model}")
+    attr(all_lm_tests, "chosen_model") <- chosen_model
+    lm_tests_sigs
+}
+
+
+# GROSSSS
+mod <- Model.9
+shp_spat <- 
+  shp |> 
+  mutate(nb = st_contiguity(geometry, queen = TRUE)
+         , wt = st_weights(nb))
+
+# defeates the whole purpose of sfdep. did shp_z used to fit the models need nb and wt?
+nb <- shp_spat$nb
+wt <- shp_spat$wt
+
+which_sar_model(mod, nb, wt)
+
+which_sar_model(Model.1, nb, wt)  
+which_sar_model(Model.9, nb, wt)
+which_sar_model(Model.13,nb, wt)
+```
+
+
+
+### fit the appropriate spatial model
+
+### diagnostics
+
+### full worked example with a "real" dataset
+
+### Make Spatial Data
+
+A sibling package, [spdgp](https://github.com/josiahParry/spdgp), which stands for SPatial Data Generation Process. The {spdgp} package is an R port of the [pysal](https://pysal.org/) module [dgp](https://pysal.org/spreg/api.html#dgp) within the [spreg](https://pysal.org/spreg/) python library.
+
+```{r}
+# install pak and spdgp, if not already done. This can be skipped if already installed
+if (!requireNamespace("pak")) {
+    install.packages("pak")
+}
+
+pak::pak("josiahparry/spdgp")
+```
+
+```{r}
+library(spdgp)
+set.seed(123) # for reproducibility
+
+ncol <- 20
+
+# Create spatial weights for a grid
+n <- ncol^2
+listw <- sim_grid_listw(ncol, ncol)
+
+# Simulate random errors
+u <- make_error(n)
+
+# Generate 4 x variables
+x <- make_x(
+  n,
+  mu = c(0.25, 5, 10, .1),
+  var = c(1, 0.75, 2, .001),
+  method = "normal"
+)
+
+# create xb with intercept = 1, beta1 = 2, beta2 = -3
+xb <- make_xb(x, c(1, 2, -3, 1.5, .01))
+y <- sim_sar(u, xb, listw)
+
+# combine data 
+(df <- tibble::tibble(y, x))
+
+# notice that the means are close to 0.25, 5, 10, and .1
+df |> summary() 
+
+
+```
